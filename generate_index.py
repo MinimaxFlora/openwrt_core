@@ -1,392 +1,748 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+generate_index.py — openwrt_core · kmod branch package-index generator
+
+Walks the repository tree and writes a self-contained index.html into every
+directory (GitHub Pages style). No external assets: all CSS, JS and icons are
+inlined so the pages work from any static host (incl. CDNs in front of Pages).
+
+All directory navigation (folder rows, "..", breadcrumbs) links explicitly to
+each folder's index.html rather than to bare directory URLs ("foo/", "../"),
+so the pages also browse correctly straight from disk via file:// — browsers
+do not auto-serve index.html for file:// directory paths. The explicit form
+works identically on HTTP hosts.
+
+Usage:
+    python generate_index.py [BASE_DIR]
+
+Design (v5) — pixel-faithful to the init2.cooluc.com Caddy browse look:
+  * List view default. Header band flush to the container's left edge: a
+    "Folder Path" micro-label + large breadcrumb path (/ -> segment -> ... ->
+    current). No logo icon in front of the path (the reference has none).
+  * Meta bar with directories/files/total summary and a List|Grid switch.
+  * Table column scheme copied from the reference: leading gutter column so
+    the "Name" header, folder icons and file icons all share the same x
+    origin; then name, proportional size bar, client-localized time.
+  * No copy buttons (reference has none); Search sits inline right after the
+    "Name" header label (as on the reference), natural-aware click-to-sort
+    with caret, directories always on top, no row borders, light-blue hover,
+    OS-following dark scheme.
+  * Grid view: 5 columns on desktop, 75px icons, name + small size under the
+    icon; the whole card including the big icon is one link (clicking the
+    icon opens the entry — the reference has no lightbox/fullscreen JS).
+  * Footer: centered "Copyright © 2026 MinimaxFlora". Favicon is the official
+    OpenWrt mark (openwrt.org) embedded as data: PNG, shown by the browser in
+    front of the URL.
+"""
+
+import base64
 import html
+import os
+import re
+import sys
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 
-EXCLUDE_FILES = ['index.html', 'generate_index.py', 'commit_msg.txt', 'CNAME']
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SITE_NAME = "MinimaxFlora"
 
-TEMPLATE = """<!DOCTYPE html>
+# Files never listed (and never linked) on any index page.
+EXCLUDE_FILES = {
+    "index.html",
+    "generate_index.py",
+    "commit_msg.txt",
+    "CNAME",
+    # OpenWrt feed-metadata noise shipped inside the snapshot tarballs:
+    "index.json",
+    "packages.adb",
+    "packages.manifest",
+    "Packages",
+    "Packages.gz",
+    "Packages.sig",
+    "Packages.cert",
+}
+
+# ---------------------------------------------------------------------------
+# Icons
+# ---------------------------------------------------------------------------
+# Site favicon = the official OpenWrt logo (as used by openwrt.org), embedded
+# as base64 PNG so every page stays self-contained. It is the icon a browser
+# shows in front of the URL (omnibox / tab). Extracted from openwrt.org's
+# /favicon.ico 32x32 frame.
+FAVICON_PNG_B64 = (
+    "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"
+)
+FAVICON_HREF = "data:image/png;base64," + FAVICON_PNG_B64
+
+# Row icon sprite (referenced with <use href="#i-...">)
+ICON_SPRITE = """<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M9 3a1 1 0 0 1 .608.206l.1.087l2.706 2.707h6.586a3 3 0 0 1 2.995 2.824l.005.176v8a3 3 0 0 1-2.824 2.995l-.176.005h-14a3 3 0 0 1-2.995-2.824l-.005-.176v-11a3 3 0 0 1 2.824-2.995l.176-.005h4z" stroke-width="0"/></symbol>
+<symbol id="i-archive" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></symbol>
+<symbol id="i-up" viewBox="0 0 24 24"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></symbol>
+</svg>"""
+
+IC_SEARCH = '<svg class="ic" aria-hidden="true" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>'
+IC_CARET = '<svg class="caret-ic" aria-hidden="true" viewBox="0 0 24 24"><path d="M18 15l-6-6l-6 6h12"/></svg>'
+IC_LIST_ROWS = '<svg class="ic" aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="5" rx="1"/><rect x="4" y="15" width="16" height="5" rx="1"/></svg>'
+IC_LIST = '<svg class="ic" aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>'
+
+# ---------------------------------------------------------------------------
+# Natural sort key ("6.12.9" < "6.12.103")
+# ---------------------------------------------------------------------------
+_NUM_RE = re.compile(r"(\d+)")
+
+
+def _nat_key(text):
+    return [int(p) if p.isdigit() else p.lower() for p in _NUM_RE.split(text)]
+
+
+def fmt_size(n):
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GiB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.2f} MiB"
+    if n >= 1024:
+        return f"{n / 1024:.2f} KiB"
+    return f"{n} B"
+
+
+def fmt_num(n):
+    return f"{n:,}"
+
+
+# ---------------------------------------------------------------------------
+# Page template (tokens: @@KEY@@ replaced by render())
+# ---------------------------------------------------------------------------
+TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
-    <title>Index of {directory_plain}</title>
-    <style>
-        :root {{
-            --bg-color: #fafafa;
-            --card-bg: #ffffff;
-            --text-main: #202124;
-            --text-sub: #5f6368;
-            --link-color: #1a73e8;
-            --border-color: #f0f0f0;
-            --hover-bg: #f8f9fa;
-        }}
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Package index for @@CANON@@">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="@@FAVICON@@">
+<title>@@TITLE@@</title>
+<style>
+/* ============================ tokens ============================ */
+:root{
+  --bg:#f3f6f7;
+  --card:#ffffff;
+  --ink:#333333;
+  --ink-soft:#4c5a68;
+  --muted:#7c8794;
+  --mut-2:#939393;
+  --link:#006ed3;
+  --link-h:#0095e4;
+  --row-hover:#f4f9fd;
+  --line:#e5e9ea;
+  --line-soft:#eef2f5;
+  --ic-file:#454545;
+  --folder:#ffb900;
+  --bar:#dbeeff;
+  --th:#6f7c8b;
+  --crumb-cur:#6a7683;
+  --crumb-hl:#fff3bf;
+  --input-bd:#cccccc;
+  --sw-bd:#d9e0e6;
+  --sw-cur:#eef3f8;
+  --grid-sub:#496a84;
+  --foot:#7e8a97;
+  --shadow-card:0 2px 5px 1px rgba(0,0,0,.05),0 14px 34px -24px rgba(15,23,42,.16);
+  --shadow-band:0 0 20px 0 rgba(0,0,0,.06);
+  --radius:8px;
+  --axis:56px;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg-top:#223242;--bg-bot:#1a1f26;
+    --card:#101720;
+    --ink:#cccccc;
+    --ink-soft:#c8d4e2;
+    --muted:#8a9cb3;
+    --mut-2:#7e8fa3;
+    --link:#abc8e3;
+    --link-h:#ffffff;
+    --row-hover:#162030;
+    --line:#222e3b;
+    --line-soft:#18222e;
+    --ic-file:#abc8e3;
+    --folder:#ffb900;
+    --bar:#1f3549;
+    --th:#8ba0b8;
+    --crumb-cur:#8f9fb0;
+    --crumb-hl:rgba(128,170,230,.22);
+    --input-bd:#29435c;
+    --sw-bd:#2a3a4c;
+    --sw-cur:#18212c;
+    --grid-sub:#6f8ba8;
+    --grid-card:#080b0f;
+    --foot:#77889c;
+    --shadow-card:0 2px 6px rgba(0,0,0,.3);
+    --shadow-band:0 0 20px 0 rgba(0,0,0,.35);
+  }
+}
 
-        * {{
-            box-sizing: border-box;
-        }}
+/* ============================ base ============================ */
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+html{background:#10151c}
+body{
+  margin:0;font-family:var(--font);font-size:15px;line-height:1.55;
+  color:var(--ink);text-rendering:optimizeSpeed;-webkit-font-smoothing:antialiased;
+  background-color:var(--bg);min-height:100vh;
+}
+@media (prefers-color-scheme:dark){
+  body{background:linear-gradient(180deg,var(--bg-top) 0%,var(--bg-bot) 100%) fixed}
+}
+a{color:var(--link);text-decoration:none}
+.ic{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
 
-        html, body {{
-            height: 100%;
-        }}
+/* ============================ header band ============================ */
+.band{background:var(--card);box-shadow:var(--shadow-band)}
+.band-in{max-width:1200px;margin:0 auto;padding:15px 20px 15px 0}
+.pathlabel{
+  text-transform:uppercase;font-size:10px;letter-spacing:1.4px;
+  color:var(--mut-2);margin:0 0 4px 3px;
+}
+h1.path{
+  margin:0;font-size:20px;font-weight:550;color:var(--ink);
+  white-space:nowrap;overflow-x:auto;scrollbar-width:thin;
+  padding-bottom:2px;line-height:1.35;
+}
+h1.path::-webkit-scrollbar{height:5px}
+h1.path::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+h1.path a{color:var(--ink);padding:1px 5px;margin:0 1px;border-radius:5px;transition:background .12s,color .12s}
+h1.path a:hover{background:var(--crumb-hl)}
+h1.path .sep{color:var(--mut-2);margin:0 2px;font-weight:400;user-select:none}
+h1.path .cur{color:var(--crumb-cur);font-weight:600}
 
-        body {{ 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            margin: 0;
-            padding: 12px 12px 0 12px;
-            color: var(--text-main); 
-            background-color: var(--bg-color); 
-            line-height: 1.5;
-            display: flex;
-            flex-direction: column;
-        }}
+/* ============================ main card ============================ */
+main.wrap{max-width:1200px;margin:24px auto 0}
+.card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow-card);overflow:hidden;margin:0}
 
-        .main-content {{
-            flex: 1 0 auto;
-            width: 100%;
-        }}
+/* ============================ meta bar ============================ */
+.meta{
+  display:flex;align-items:center;flex-wrap:wrap;gap:8px 20px;
+  padding:12px 20px 12px var(--axis);border-bottom:1px solid var(--line);
+}
+#summary{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 22px;margin-right:auto}
+.meta-item{font-size:14px;color:var(--muted);white-space:nowrap}
+.meta-item b{font-weight:650;color:var(--ink);font-variant-numeric:tabular-nums}
+.switch{display:inline-flex;align-items:center;gap:2px;border:1px solid var(--sw-bd);border-radius:7px;overflow:hidden}
+.layout{
+  display:inline-flex;align-items:center;gap:5px;padding:5px 11px;
+  font-size:12.5px;font-weight:500;color:var(--muted);
+  background:transparent;border:0;cursor:pointer;font-family:inherit;
+  transition:color .12s,background .12s;white-space:nowrap;
+}
+.layout .ic{width:14px;height:14px}
+.layout:hover{color:var(--ink)}
+.layout.current{background:var(--sw-cur);color:var(--ink);cursor:default}
 
-        .container {{ 
-            background: var(--card-bg); 
-            border-radius: 8px; 
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
-            padding: 16px; 
-            max-width: 1000px; 
-            margin: 0 auto; 
-        }}
+/* ============================ table (list) ============================ */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+col.cg-gutter{width:var(--axis)}
+col.cg-size{width:170px}
+col.cg-date{width:210px}
+thead th{
+  position:sticky;top:0;z-index:5;background:var(--card);
+  text-align:left;font-size:14px;font-weight:650;letter-spacing:1px;
+  text-transform:uppercase;color:var(--th);
+  height:46px;padding:0 12px;white-space:nowrap;vertical-align:middle;
+}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--ink)}
+.th-lab{display:inline-flex;align-items:center;gap:5px}
+.caret{display:inline-flex;width:12px;height:12px;color:var(--link);opacity:0;transition:opacity .12s}
+.caret-ic{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+th.desc .caret{transform:rotate(180deg)}
+th.asc .caret,th.desc .caret{opacity:1}
+.th-name{position:relative}
+.filter-container{
+  position:relative;display:inline-flex;align-items:center;
+  margin-left:14px;vertical-align:middle;
+}
+#filter{
+  width:150px;height:27px;padding:0 8px 0 26px;
+  border:1px solid var(--input-bd);border-radius:5px;
+  background:var(--card);color:var(--ink);
+  font-family:inherit;font-size:13px;outline:none;transition:border-color .12s;
+}
+#filter::placeholder{color:var(--mut-2)}
+#filter:focus{border-color:var(--link)}
+.filter-container > .ic{
+  position:absolute;left:7px;top:50%;translate:0 -50%;
+  width:13px;height:13px;color:var(--mut-2);pointer-events:none;
+}
 
-        .breadcrumbs-wrapper {{
-            overflow-x: auto;
-            white-space: nowrap;
-            margin-bottom: 16px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid #e0e0e0;
-            -webkit-overflow-scrolling: touch;
-        }}
+tbody td{vertical-align:middle;padding:0}
+tbody tr{transition:background .1s}
+tbody tr:hover{background:var(--row-hover)}
 
-        .breadcrumbs {{ 
-            font-size: 16px; 
-            color: var(--text-main); 
-            font-weight: 400; 
-            display: inline-block;
-        }}
+td.c-name{position:relative}
+td.c-name a.row-link{
+  display:flex;align-items:center;gap:11px;min-width:0;
+  padding:9px 14px 9px 0;color:var(--ink);
+}
+.row-link .ic{width:22px;height:22px;flex:none}
+.row-dir .row-link .ic{color:var(--folder);stroke:none;fill:var(--folder)}
+.row-dir .row-link .nm{font-weight:550}
+.row-dir .row-link .nm::after{content:"/";color:var(--mut-2);margin-left:1px;font-weight:400}
+.row-file .row-link .ic{color:var(--ic-file)}
+.nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;font-size:16px;color:inherit}
+a.row-link:hover .nm{color:var(--link-h)}
+.row-dir a.row-link:hover .nm{color:var(--link-h)}
+.row-parent a.row-link{color:var(--mut-2)}
+.row-parent .nm{font-size:12.5px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}
 
-        .breadcrumbs a {{ 
-            color: var(--link-color); 
-            text-decoration: none; 
-        }}
+td.c-size{width:170px;padding:0 8px;text-align:left}
+.sizebar{position:relative;display:flex;align-items:center;padding:.28rem .5rem;margin:1px 0;min-height:24px;overflow:hidden}
+.sizebar-bar{position:absolute;top:0;left:0;bottom:0;background:var(--bar);width:0;pointer-events:none}
+.sizebar-text{position:relative;z-index:1;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+.dash{color:var(--mut-2);font-size:14px}
+td.c-date{width:210px;color:var(--ink-soft);font-size:14px;white-space:nowrap;padding:0 14px 0 4px;font-variant-numeric:tabular-nums}
 
-        .breadcrumbs a:hover {{ 
-            text-decoration: underline; 
-        }}
+/* empty state */
+tr.row-empty td{padding:46px 12px!important;text-align:center;color:var(--mut-2);font-size:13px}
 
-        .breadcrumbs .separator {{ 
-            margin: 0 4px; 
-            color: var(--text-sub); 
-            user-select: none; 
-        }}
+/* ============================ grid view ============================ */
+.grid-view thead,.grid-view colgroup{display:none}
+.grid-view table{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(216px,1fr));
+  gap:2px;padding:8px;
+}
+.grid-view tbody{display:contents}
+.grid-view tbody tr{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  min-height:170px;padding:20px 10px 14px;text-align:center;
+}
+.grid-view tbody tr:hover{background:var(--row-hover)}
+.grid-view tbody tr.row-empty{display:none}
+.grid-view td{border:0;padding:0;width:auto}
+.grid-view td.c-gutter,.grid-view td.c-date{display:none}
+.grid-view td.c-name{width:100%}
+.grid-view td.c-name a.row-link{
+  flex-direction:column;gap:0;padding:0;width:100%;
+  align-items:center;text-align:center;
+}
+.grid-view .row-link .ic{width:75px;height:75px;stroke-width:1}
+.grid-view .nm{
+  margin-top:12px;max-width:100%;font-size:14px;
+  white-space:normal;word-break:break-all;overflow-wrap:anywhere;line-height:1.35;
+}
+.grid-view td.c-size{
+  display:block;width:auto;padding:0 4px;margin-top:6px;text-align:center;
+}
+.grid-view .sizebar{padding:0;min-height:0;margin:0}
+.grid-view .sizebar-bar{display:none}
+.grid-view .sizebar-text{font-size:12px;color:var(--grid-sub)}
+.grid-view tr.row-parent{grid-column:1/-1;min-height:0;flex-direction:row;justify-content:flex-start;padding:6px 14px;border-radius:6px}
+.grid-view tr.row-parent .row-link{padding:2px 0;flex-direction:row;gap:8px}
+.grid-view tr.row-parent .row-link .ic{width:15px;height:15px}
+.grid-view tr.row-parent .nm{margin:0;font-size:12px}
+@media (prefers-color-scheme:dark){
+  .grid-view tbody tr{background:var(--grid-card)}
+  .grid-view tbody tr:hover{background:var(--row-hover)}
+  .grid-view tbody tr.row-parent{background:transparent}
+}
 
-        .table-responsive {{
-            width: 100%;
-            overflow-x: auto;
-        }}
+/* ============================ footer ============================ */
+.foot{
+  max-width:1200px;margin:0 auto;padding:32px 20px 46px;
+  text-align:center;color:var(--muted);font-size:12.5px;
+}
 
-        table {{ 
-            width: 100%; 
-            border-collapse: collapse; 
-            text-align: left; 
-            table-layout: fixed;
-        }}
-
-        th, td {{ 
-            padding: 12px 8px; 
-            border-bottom: 1px solid var(--border-color); 
-            word-break: break-word;
-        }}
-
-        th {{ 
-            font-weight: 600; 
-            color: var(--text-sub); 
-            background-color: #f8f9fa; 
-            font-size: 13px;
-            cursor: pointer;
-            user-select: none;
-            transition: background-color 0.2s;
-        }}
-
-        th:hover {{
-            background-color: #e8eaed;
-            color: var(--text-main);
-        }}
-
-        th::after {{
-            content: ' ↕';
-            opacity: 0.3;
-            font-size: 11px;
-        }}
-
-        th.asc::after {{
-            content: ' ▲';
-            opacity: 1;
-            color: var(--link-color);
-        }}
-
-        th.desc::after {{
-            content: ' ▼';
-            opacity: 1;
-            color: var(--link-color);
-        }}
-
-        tr:hover {{ 
-            background-color: var(--hover-bg); 
-        }}
-
-        .col-name {{ width: 55%; }}
-        .col-date {{ width: 25%; }}
-        .col-size {{ width: 20%; }}
-
-        td a {{ 
-            color: var(--link-color); 
-            text-decoration: none; 
-            font-weight: 500; 
-            display: block; 
-            width: 100%;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }}
-
-        td a:hover {{ 
-            text-decoration: underline; 
-        }}
-
-        .parent-dir {{ 
-            font-weight: bold; 
-            color: var(--text-sub); 
-        }}
-
-        .size, .date {{ 
-            color: var(--text-sub); 
-            font-size: 13px; 
-        }}
-
-        .footer {{
-            flex-shrink: 0;
-            text-align: center;
-            padding: 20px 0;
-            font-size: 13px;
-            color: var(--text-sub);
-        }}
-
-        .footer a {{
-            color: var(--text-sub);
-            text-decoration: underline;
-        }}
-
-        .footer a:hover {{
-            color: var(--link-color);
-        }}
-
-        @media (max-width: 600px) {{
-            body {{
-                padding: 8px 8px 0 8px;
-            }}
-
-            .container {{
-                padding: 12px;
-                border-radius: 6px;
-            }}
-
-            .breadcrumbs {{
-                font-size: 15px;
-            }}
-
-            th, td {{
-                padding: 10px 4px;
-            }}
-
-            .col-date, .date {{
-                display: none;
-            }}
-
-            .col-name {{ width: 70%; }}
-            .col-size {{ width: 30%; text-align: right; }}
-            th.col-size {{ text-align: right; }}
-
-            td a {{
-                padding: 4px 0;
-            }}
-
-            .footer {{
-                padding: 16px 0;
-                font-size: 12px;
-            }}
-        }}
-    </style>
+/* ============================ responsive ============================ */
+@media (max-width:900px){
+  :root{--axis:34px}
+}
+@media (max-width:760px){
+  :root{--axis:24px}
+  .band-in{padding:12px 12px 12px 12px}
+  h1.path{font-size:17px}
+  .meta{padding:10px 12px 10px var(--axis);gap:6px 14px}
+  #summary{gap:2px 14px}
+  .meta-item{font-size:13px}
+  col.cg-gutter{width:var(--axis)}
+  col.cg-size{width:110px}
+  td.c-size{width:110px;padding:0 6px}
+  #filter{width:96px}
+  th.th-date,td.c-date{display:none}
+  .grid-view table{grid-template-columns:repeat(auto-fill,minmax(128px,1fr))}
+  .grid-view .row-link .ic{width:64px;height:64px}
+}
+</style>
 </head>
 <body>
-    <div class="main-content">
-        <div class="container">
-            <div class="breadcrumbs-wrapper">
-                <div class="breadcrumbs">
-                    {breadcrumbs}
-                </div>
-            </div>
-            <div class="table-responsive">
-                <table id="file-table">
-                    <thead>
-                        <tr>
-                            <th class="col-name" onclick="sortTable(0, 'string')">Name</th>
-                            <th class="col-date" onclick="sortTable(1, 'number')">Last Modified</th>
-                            <th class="col-size" onclick="sortTable(2, 'number')">Size</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {parent_row}
-                        {rows}
-                    </tbody>
-                </table>
-            </div>
-        </div>
+@@SPRITE@@
+
+<header class="band">
+  <div class="band-in">
+    <p class="pathlabel">Folder Path</p>
+    <h1 class="path">@@CRUMBS@@</h1>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="card">
+    <div class="meta">
+      <div id="summary">@@META@@</div>
+      <div class="switch" role="group" aria-label="View layout">
+        <button class="layout current" id="layout-list" type="button">@@IC_LIST_ROWS@@List</button>
+        <button class="layout" id="layout-grid" type="button">@@IC_LIST@@Grid</button>
+      </div>
     </div>
-    <footer class="footer">
-        Powered by <a href="https://pages.github.com/" target="_blank" rel="noopener">GitHub Pages</a> | Served by EdgeOne
-    </footer>
-    <script>
-        let sortDirections = [true, true, true];
+    <div class="tbl-wrap">
+      <table id="file-table" aria-describedby="summary">
+        <colgroup>
+          <col class="cg-gutter">
+          <col>
+          <col class="cg-size">
+          <col class="cg-date">
+        </colgroup>
+        <thead>
+          <tr>
+            <th aria-hidden="true"></th>
+            <th class="th-name sortable" data-col="1" data-type="string" scope="col" aria-sort="ascending">
+              <span class="th-lab"><span class="caret">@@IC_CARET@@</span>Name</span>
+              <span class="filter-container">
+                @@IC_SEARCH@@
+                <input id="filter" type="search" placeholder="Search" autocomplete="off" spellcheck="false" aria-label="Filter entries">
+              </span>
+            </th>
+            <th class="sortable" data-col="2" data-type="number" scope="col"><span class="th-lab"><span class="caret">@@IC_CARET@@</span>Size</span></th>
+            <th class="th-date sortable" data-col="3" data-type="number" scope="col"><span class="th-lab"><span class="caret">@@IC_CARET@@</span>Modified</span></th>
+          </tr>
+        </thead>
+        <tbody>
+@@ROWS@@
+        </tbody>
+      </table>
+    </div>
+  </div>
+</main>
 
-        function sortTable(colIndex, type) {{
-            const table = document.getElementById("file-table");
-            const tbody = table.querySelector("tbody");
-            const rows = Array.from(tbody.querySelectorAll("tr"));
-            const headers = table.querySelectorAll("th");
+<footer class="foot">
+  <span>Copyright &copy; 2026 @@SITE_NAME@@</span>
+</footer>
 
-            let parentRow = null;
-            if (rows.length > 0 && rows[0].querySelector(".parent-dir")) {{
-                parentRow = rows.shift();
-            }}
+<script>
+(function(){
+"use strict";
+var table=document.getElementById("file-table");
+var tbody=table.querySelector("tbody");
+var filter=document.getElementById("filter");
+var collator=new Intl.Collator(undefined,{numeric:true,sensitivity:"base"});
 
-            const isAscending = sortDirections[colIndex];
-            sortDirections[colIndex] = !isAscending;
+/* ---------- layout switch (List | Grid), persisted ---------- */
+var LAYOUT_KEY="layout";
+function applyLayout(mode){
+  document.body.classList.toggle("grid-view",mode==="grid");
+  document.getElementById("layout-list").classList.toggle("current",mode!=="grid");
+  document.getElementById("layout-grid").classList.toggle("current",mode==="grid");
+}
+function initLayout(){
+  var stored=null;
+  try{stored=localStorage.getItem(LAYOUT_KEY);}catch(e){}
+  var mode=stored==="grid"||stored==="list"
+    ? stored
+    : (document.body.classList.contains("grid-view")?"grid":"list");
+  applyLayout(mode);
+}
+document.getElementById("layout-list").addEventListener("click",function(){
+  applyLayout("list");
+  try{localStorage.setItem(LAYOUT_KEY,"list");}catch(e){}
+});
+document.getElementById("layout-grid").addEventListener("click",function(){
+  applyLayout("grid");
+  try{localStorage.setItem(LAYOUT_KEY,"grid");}catch(e){}
+});
+initLayout();
 
-            headers.forEach((h, idx) => {{
-                if (idx === colIndex) {{
-                    h.classList.remove("asc", "desc");
-                    h.classList.add(isAscending ? "asc" : "desc");
-                }} else {{
-                    h.classList.remove("asc", "desc");
-                }}
-            }});
+/* ---------- filter (name only, like the reference) ---------- */
+function applyFilter(){
+  var q=filter.value.trim().toLowerCase();
+  var rows=tbody.querySelectorAll("tr");
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];
+    if(r.classList.contains("row-parent")||r.classList.contains("row-empty"))continue;
+    r.style.display=(!q||(r.getAttribute("data-key")||"").indexOf(q)!==-1)?"":"none";
+  }
+}
+filter.addEventListener("input",applyFilter);
+document.addEventListener("keydown",function(e){
+  var t=e.target;
+  var typing=t&&(t.tagName==="INPUT"||t.tagName==="TEXTAREA"||t.isContentEditable);
+  if(e.key==="/"&&!typing){e.preventDefault();filter.focus();}
+  else if(e.key==="Escape"&&document.activeElement===filter){filter.value="";applyFilter();filter.blur();}
+});
 
-            rows.sort((rowA, rowB) => {{
-                const cellA = rowA.children[colIndex];
-                const cellB = rowB.children[colIndex];
+/* ---------- sort (directories always first; caret on active column) ---------- */
+function val(r,col){return (r.children[col]&&r.children[col].getAttribute("data-sort"))||"";}
+function sortRows(list,col,type,asc){
+  var sign=asc?1:-1;
+  list.sort(function(a,b){
+    if(type==="string"){
+      var ka=(a.getAttribute("data-key")||"").toLowerCase();
+      var kb=(b.getAttribute("data-key")||"").toLowerCase();
+      return sign*collator.compare(ka,kb);
+    }else{
+      var va=parseFloat(val(a,col))||0;
+      var vb=parseFloat(val(b,col))||0;
+      return sign*(va-vb);
+    }
+  });
+  return list;
+}
+function sortTable(col,type,asc){
+  var dirs=[],files=[];
+  var rows=tbody.querySelectorAll("tr");
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];
+    if(r.classList.contains("row-parent")||r.classList.contains("row-empty"))continue;
+    if(r.classList.contains("row-dir"))dirs.push(r);else files.push(r);
+  }
+  var arr=sortRows(dirs,col,type,asc).concat(sortRows(files,col,type,asc));
+  var extra=tbody.querySelector(".row-parent, .row-empty");
+  tbody.innerHTML="";
+  if(extra)tbody.appendChild(extra);
+  for(var i=0;i<arr.length;i++)tbody.appendChild(arr[i]);
+  applyFilter();
+}
+table.querySelectorAll("th.sortable").forEach(function(th){
+  th.addEventListener("click",function(e){
+    if(e.target.closest(".filter-container"))return;
+    var col=+th.getAttribute("data-col"),type=th.getAttribute("data-type");
+    var asc=!th.classList.contains("asc");
+    table.querySelectorAll("th").forEach(function(h){
+      h.classList.remove("asc","desc");
+      h.setAttribute("aria-sort","none");
+    });
+    th.classList.add(asc?"asc":"desc");
+    th.setAttribute("aria-sort",asc?"ascending":"descending");
+    sortTable(col,type,asc);
+  });
+});
 
-                let valA = cellA.getAttribute("data-sort") || cellA.textContent.trim();
-                let valB = cellB.getAttribute("data-sort") || cellB.textContent.trim();
+/* ---------- size bars (proportional to the largest file) ---------- */
+function initSizeBars(){
+  var sizes=document.querySelectorAll("td.c-size[data-size]");
+  var largest=0;
+  sizes.forEach(function(td){largest=Math.max(largest,Number(td.getAttribute("data-size"))||0);});
+  if(!largest)return;
+  sizes.forEach(function(td){
+    var bar=td.querySelector(".sizebar-bar");
+    if(bar)bar.style.width=((Number(td.getAttribute("data-size"))||0)/largest*100)+"%";
+  });
+}
 
-                if (type === "number") {{
-                    valA = parseFloat(valA) || 0;
-                    valB = parseFloat(valB) || 0;
-                }} else {{
-                    valA = valA.toLowerCase();
-                    valB = valB.toLowerCase();
-                }}
+/* ---------- localize timestamps (reference does the same) ---------- */
+function localizeTimes(){
+  document.querySelectorAll("time[datetime]").forEach(function(t){
+    var d=new Date(t.getAttribute("datetime"));
+    if(!isNaN(d.getTime()))t.textContent=d.toLocaleString();
+  });
+}
 
-                if (valA < valB) return isAscending ? -1 : 1;
-                if (valA > valB) return isAscending ? 1 : -1;
-                return 0;
-            }});
-
-            tbody.innerHTML = "";
-            if (parentRow) tbody.appendChild(parentRow);
-            rows.forEach(row => tbody.appendChild(row));
-        }}
-    </script>
+/* ---------- init ---------- */
+initSizeBars();
+localizeTimes();
+sortTable(1,"string",true);
+table.querySelector("th[data-col='1']").classList.add("asc");
+table.querySelector("th[data-col='1']").setAttribute("aria-sort","ascending");
+})();
+</script>
 </body>
 </html>
 """
 
-def get_readable_size(size_in_bytes):
-    if size_in_bytes >= 1024 * 1024:
-        return f"{size_in_bytes / (1024 * 1024):.2f} MiB"
-    elif size_in_bytes >= 1024:
-        return f"{size_in_bytes / 1024:.2f} KiB"
-    return f"{size_in_bytes} B"
 
-def make_breadcrumbs(rel_path):
-    if rel_path == ".":
-        return "<span>Index of /</span>"
-        
+def make_crumbs(rel_path):
     parts = [p for p in rel_path.split(os.sep) if p and p != "."]
-    total_parts = len(parts)
-    
-    html_snippets = ['<a href="' + '../' * total_parts + '">Index of</a>']
-    
+    total = len(parts)
+    root_href = ("../" * total + "index.html") if total else "./index.html"
+    out = ['<a href="' + root_href + '">/</a>']
     for i, part in enumerate(parts):
-        if i == total_parts - 1:
-            html_snippets.append(f"<span>{html.escape(part)}</span>")
+        if i > 0:
+            out.append('<span class="sep" aria-hidden="true">/</span>')
+        if i == total - 1:
+            out.append('<span class="cur" title="' + html.escape(part) + '">'
+                       + html.escape(part) + "</span>")
         else:
-            back_depth = "../" * (total_parts - 1 - i)
-            html_snippets.append(f'<a href="{back_depth}">{html.escape(part)}</a>')
-            
-    return '<span class="separator">/</span>'.join(html_snippets) + '<span class="separator">/</span>'
+            out.append('<a href="' + ("../" * (total - 1 - i)) + 'index.html">'
+                       + html.escape(part) + "</a>")
+    return "".join(out)
+
+
+def render_page(rel_path, crumbs, meta, rows_html):
+    canon = "/" if rel_path == "." else "/" + rel_path.replace(os.sep, "/") + "/"
+    title = f"Index of {canon} · openwrt_core"
+
+    return (
+        TEMPLATE.replace("@@TITLE@@", html.escape(title))
+        .replace("@@CANON@@", html.escape(canon))
+        .replace("@@FAVICON@@", FAVICON_HREF)
+        .replace("@@IC_SEARCH@@", IC_SEARCH)
+        .replace("@@IC_CARET@@", IC_CARET)
+        .replace("@@IC_LIST@@", IC_LIST)
+        .replace("@@IC_LIST_ROWS@@", IC_LIST_ROWS)
+        .replace("@@SITE_NAME@@", SITE_NAME)
+        .replace("@@CRUMBS@@", crumbs)
+        .replace("@@META@@", meta)
+        .replace("@@ROWS@@", rows_html)
+        .replace("@@SPRITE@@", ICON_SPRITE)
+    )
+
+
+def fmt_time(mtime):
+    if not mtime:
+        return "", "-"
+    try:
+        dt = datetime.fromtimestamp(mtime, timezone.utc)
+        iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OSError, ValueError, OverflowError):
+        iso = ""
+    local = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    return iso, local
+
 
 def generate_repo_indexes(base_dir):
+    base_dir = os.path.abspath(base_dir)
     for root, dirs, files in os.walk(base_dir):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-
+        dirs[:] = sorted((d for d in dirs if not d.startswith(".")), key=_nat_key)
         rel_path = os.path.relpath(root, base_dir)
-        display_path = "/" if rel_path == "." else f"/{rel_path}/"
-        
-        breadcrumbs_html = make_breadcrumbs(rel_path)
-        
+
+        listed = [f for f in sorted(files, key=_nat_key)
+                  if f not in EXCLUDE_FILES and not f.startswith(".")]
+
+        dir_rows, file_rows = [], []
+        total_size = 0
+        n_apk = 0
+
+        for d in dirs:
+            d_path = os.path.join(root, d)
+            try:
+                mtime = os.path.getmtime(d_path)
+            except OSError:
+                mtime = 0
+            iso, local_str = fmt_time(mtime)
+            quoted = urllib.parse.quote(d)
+            name = html.escape(d)
+            dir_rows.append(
+                '<tr class="row-dir" data-key="' + name.lower() + '/" data-ext="dir">'
+                '<td class="c-gutter"></td>'
+                '<td class="c-name" data-sort="' + name.lower() + '">'
+                '<a class="row-link" href="' + quoted + '/index.html" title="' + name + '/">'
+                '<svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>'
+                '<span class="nm">' + name + "</span></a></td>"
+                '<td class="c-size" data-sort="-1"><span class="dash">&mdash;</span></td>'
+                '<td class="c-date" data-sort="' + str(int(mtime)) + '"><time datetime="' + iso + '">'
+                + local_str + "</time></td></tr>"
+            )
+
+        for f in listed:
+            f_path = os.path.join(root, f)
+            try:
+                st = os.stat(f_path)
+            except OSError:
+                continue
+            mtime, size = st.st_mtime, st.st_size
+            total_size += size
+            if os.path.splitext(f)[1].lower() == ".apk":
+                n_apk += 1
+            iso, local_str = fmt_time(mtime)
+            size_str = fmt_size(size)
+            quoted = urllib.parse.quote(f)
+            name = html.escape(f)
+            ext = os.path.splitext(f)[1].lstrip(".").lower() or "bin"
+            icn = "archive" if ext == "apk" else "file"
+            file_rows.append(
+                '<tr class="row-file" data-key="' + name.lower() + '" data-ext="' + html.escape(ext) + '">'
+                '<td class="c-gutter"></td>'
+                '<td class="c-name" data-sort="' + name.lower() + '">'
+                '<a class="row-link" href="' + quoted + '" title="' + name + '">'
+                '<svg class="ic" aria-hidden="true"><use href="#i-' + icn + '"/></svg>'
+                '<span class="nm">' + name + "</span></a></td>"
+                '<td class="c-size" data-sort="' + str(size) + '" data-size="' + str(size) + '">'
+                '<div class="sizebar"><div class="sizebar-bar"></div>'
+                '<div class="sizebar-text">' + size_str + "</div></div></td>"
+                '<td class="c-date" data-sort="' + str(int(mtime)) + '"><time datetime="' + iso + '">'
+                + local_str + "</time></td></tr>"
+            )
+
+        rows = dir_rows + file_rows
+        n_dirs, n_files = len(dir_rows), len(file_rows)
+
+        stats = []
+        if n_dirs:
+            stats.append('<span class="meta-item"><b>' + fmt_num(n_dirs) + "</b> "
+                         + ("directory" if n_dirs == 1 else "directories") + "</span>")
+        if n_files:
+            base = "package" if n_apk == n_files else "file"
+            stats.append('<span class="meta-item"><b>' + fmt_num(n_files) + "</b> "
+                         + (base + "s" if n_files != 1 else base) + "</span>")
+        if total_size:
+            stats.append('<span class="meta-item"><b>' + fmt_size(total_size) + "</b> total</span>")
+
         parent_row = ""
         if rel_path != ".":
-            parent_row = '<tr><td class="col-name"><a class="parent-dir" href="../">📁 ..</a></td><td class="date" data-sort="0">-</td><td class="size" data-sort="-1">-</td></tr>'
-            
-        rows = []
-        
-        for d in sorted(dirs):
-            dir_path = os.path.join(root, d)
-            mtime_obj = os.path.getmtime(dir_path)
-            mtime_str = datetime.fromtimestamp(mtime_obj).strftime('%Y-%m-%d %H:%M')
-            quoted_name = urllib.parse.quote(d)
-            rows.append(
-                f'<tr>'
-                f'<td class="col-name" data-sort="0_{html.escape(d)}"><a href="{quoted_name}/">📂 {html.escape(d)}/</a></td>'
-                f'<td class="date" data-sort="{mtime_obj}">{mtime_str}</td>'
-                f'<td class="size" data-sort="-1">-</td>'
-                f'</tr>'
+            parent_row = (
+                '<tr class="row-parent">'
+                '<td class="c-gutter"></td>'
+                '<td class="c-name"><a class="row-link" href="../index.html" title="Parent directory">'
+                '<svg class="ic" aria-hidden="true"><use href="#i-up"/></svg>'
+                '<span class="nm">..</span></a></td>'
+                '<td class="c-size" data-sort="-1"><span class="dash">&mdash;</span></td>'
+                '<td class="c-date" data-sort="0">&mdash;</td></tr>'
             )
-            
-        for f in sorted(files):
-            if f in EXCLUDE_FILES or f.startswith('.'): 
-                continue
-                
-            file_path = os.path.join(root, f)
-            mtime_obj = os.path.getmtime(file_path)
-            mtime_str = datetime.fromtimestamp(mtime_obj).strftime('%Y-%m-%d %H:%M')
-            size_bytes = os.path.getsize(file_path)
-            size_str = get_readable_size(size_bytes)
-            quoted_name = urllib.parse.quote(f)
-            rows.append(
-                f'<tr>'
-                f'<td class="col-name" data-sort="1_{html.escape(f)}"><a href="{quoted_name}">📄 {html.escape(f)}</a></td>'
-                f'<td class="date" data-sort="{mtime_obj}">{mtime_str}</td>'
-                f'<td class="size" data-sort="{size_bytes}">{size_str}</td>'
-                f'</tr>'
+
+        if not rows:
+            body_rows = parent_row + (
+                '<tr class="row-empty"><td colspan="4">This directory is empty</td></tr>'
             )
-            
-        html_content = TEMPLATE.format(
-            directory_plain=html.escape(display_path),
-            breadcrumbs=breadcrumbs_html,
-            parent_row=parent_row,
-            rows="\n".join(rows)
-        )
-        
-        with open(os.path.join(root, 'index.html'), 'w', encoding='utf-8') as f_out:
-            f_out.write(html_content)
+        else:
+            body_rows = parent_row + "\n".join(rows)
+
+        crumbs = make_crumbs(rel_path)
+        meta_html = "".join(stats) if stats else '<span class="meta-item">empty</span>'
+        page = render_page(rel_path, crumbs, meta_html, body_rows)
+
+        out_path = os.path.join(root, "index.html")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(page)
+        print("wrote", os.path.relpath(out_path, base_dir))
+
 
 if __name__ == "__main__":
-    generate_repo_indexes(".")
+    generate_repo_indexes(sys.argv[1] if len(sys.argv) > 1 else ".")
