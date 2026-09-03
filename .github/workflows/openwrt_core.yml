@@ -1,0 +1,86 @@
+name: sync openwrt_core
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sync]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: openwrt_core
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: checkout kmod branch
+      uses: actions/checkout@main
+      with:
+        ref: kmod
+
+    - name: setup environment
+      run: |
+        sudo timedatectl set-timezone 'Asia/Shanghai'
+        rm -f commit_msg.txt
+
+    - name: sync x86_64
+      run: |
+        OPENWRT_VERSION="25.12"
+        TARGET_ENV="x86_64-6.12"
+        BASE_PATH="$OPENWRT_VERSION/targets/x86/64"
+        mkdir -p "$BASE_PATH"
+        
+        kmod=$(curl -sk "https://api.github.com/repos/MinimaxFlora/My-OpenWrt-Firmware/releases/tags/openwrt-25.12" | grep "browser_download_url" | grep "$TARGET_ENV" | grep -v -- "-rc" | sort -V | tail -1 | awk '{print $2}' | sed 's/\"//g')
+        if [ -n "$kmod" ]; then
+          kmod_name=$(basename $kmod | sed 's/\.tar\.gz$//;s/^[^-]*-//')
+          curl -L $kmod -o "$kmod_name.tar.gz" --progress-bar
+          
+          mkdir -p tmp_x86
+          tar zxf "$kmod_name.tar.gz" -C tmp_x86
+          
+          INNER_NAME=$(ls tmp_x86 2>/dev/null | head -n 1)
+          if [ -n "$INNER_NAME" ]; then
+            DIR_PATH="$BASE_PATH/$INNER_NAME"
+            if [ -d "$DIR_PATH" ]; then
+              echo "x86_64 target version $INNER_NAME already exists. Skipping."
+              rm -rf tmp_x86 "$kmod_name.tar.gz"
+            else
+              mv "tmp_x86/$INNER_NAME" "$DIR_PATH"
+              rm -rf tmp_x86 "$kmod_name.tar.gz"
+              
+              if [ -n "$(git status --porcelain "$DIR_PATH")" ]; then
+                echo "x86_64($INNER_NAME)" >> commit_msg.txt
+              fi
+            fi
+          else
+            rm -rf tmp_x86 "$kmod_name.tar.gz"
+          fi
+        fi
+
+    - name: Git push to kmod branch
+      run: |
+        git config --global user.email "zj18139624826@gmail.com"
+        git config --global user.name "MinimaxFlora"
+        
+        python generate_index.py
+        
+        git add 25.12/
+        
+        if [ -n "$(git status --porcelain)" ]; then
+          if [ -f commit_msg.txt ]; then
+            CHANGED_ARCHS=$(paste -sd, commit_msg.txt)
+            COMMIT_MSG="sync core: $CHANGED_ARCHS"
+          else
+            COMMIT_MSG="sync core: update index"
+          fi
+          rm -f commit_msg.txt
+          git add .
+          git commit -sm "$COMMIT_MSG"
+          git push "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" HEAD:kmod
+        else
+          echo "No changes detected. Skipping push."
+        fi
