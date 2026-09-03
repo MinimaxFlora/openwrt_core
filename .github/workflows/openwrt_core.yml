@@ -34,7 +34,7 @@ jobs:
         BASE_PATH="$OPENWRT_VERSION/targets/x86/64"
         mkdir -p "$BASE_PATH"
         
-        kmod=$(curl -sk "https://api.github.com/repos/MinimaxFlora/My-OpenWrt-Firmware/releases/tags/master" | grep "browser_download_url" | grep "$TARGET_ENV" | grep -v -- "-rc" | sort -V | tail -1 | awk '{print $2}' | sed 's/\"//g')
+        kmod=$(curl -sk "https://api.github.com/repos/MinimaxFlora/My-OpenWrt-Firmware/releases/tags/kmod-openwrt-25.12" | grep "browser_download_url" | grep "$TARGET_ENV" | grep -v -- "-rc" | sort -V | tail -1 | awk '{print $2}' | sed 's/\"//g')
         if [ -n "$kmod" ]; then
           kmod_name=$(basename $kmod | sed 's/\.tar\.gz$//;s/^[^-]*-//')
           curl -L $kmod -o "$kmod_name.tar.gz" --progress-bar
