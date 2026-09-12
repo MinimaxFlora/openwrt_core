@@ -12,75 +12,173 @@ jobs:
   build:
     name: openwrt_core
     runs-on: ubuntu-latest
+
     defaults:
       run:
         shell: bash
 
     steps:
-    - name: checkout kmod branch
-      uses: actions/checkout@main
-      with:
-        ref: kmod
+      - name: checkout kmod branch
+        uses: actions/checkout@main
+        with:
+          ref: kmod
 
-    - name: setup environment
-      run: |
-        sudo timedatectl set-timezone 'Asia/Shanghai'
-        rm -f commit_msg.txt
-
-    - name: sync x86_64
-      run: |
-        OPENWRT_VERSION="25.12"
-        TARGET_ENV="x86_64-6.12"
-        BASE_PATH="$OPENWRT_VERSION/targets/x86/64"
-        mkdir -p "$BASE_PATH"
-        
-        kmod=$(curl -sk "https://api.github.com/repos/MinimaxFlora/My-OpenWrt-Firmware/releases/tags/kmod-openwrt-25.12" | grep "browser_download_url" | grep "$TARGET_ENV" | grep -v -- "-rc" | sort -V | tail -1 | awk '{print $2}' | sed 's/\"//g')
-        if [ -n "$kmod" ]; then
-          kmod_name=$(basename $kmod | sed 's/\.tar\.gz$//;s/^[^-]*-//')
-          curl -L $kmod -o "$kmod_name.tar.gz" --progress-bar
-          
-          mkdir -p tmp_x86
-          tar zxf "$kmod_name.tar.gz" -C tmp_x86
-          
-          INNER_NAME=$(ls tmp_x86 2>/dev/null | head -n 1)
-          if [ -n "$INNER_NAME" ]; then
-            DIR_PATH="$BASE_PATH/$INNER_NAME"
-            if [ -d "$DIR_PATH" ]; then
-              echo "x86_64 target version $INNER_NAME already exists. Skipping."
-              rm -rf tmp_x86 "$kmod_name.tar.gz"
-            else
-              mv "tmp_x86/$INNER_NAME" "$DIR_PATH"
-              rm -rf tmp_x86 "$kmod_name.tar.gz"
-              
-              if [ -n "$(git status --porcelain "$DIR_PATH")" ]; then
-                echo "x86_64($INNER_NAME)" >> commit_msg.txt
-              fi
-            fi
-          else
-            rm -rf tmp_x86 "$kmod_name.tar.gz"
-          fi
-        fi
-
-    - name: Git push to kmod branch
-      run: |
-        git config --global user.email "zj18139624826@gmail.com"
-        git config --global user.name "MinimaxFlora"
-        
-        python generate_index.py
-        
-        git add 25.12/
-        
-        if [ -n "$(git status --porcelain)" ]; then
-          if [ -f commit_msg.txt ]; then
-            CHANGED_ARCHS=$(paste -sd, commit_msg.txt)
-            COMMIT_MSG="sync core: $CHANGED_ARCHS"
-          else
-            COMMIT_MSG="sync core: update index"
-          fi
+      - name: setup environment
+        run: |
+          sudo timedatectl set-timezone 'Asia/Shanghai'
           rm -f commit_msg.txt
-          git add .
-          git commit -sm "$COMMIT_MSG"
-          git push "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" HEAD:kmod
-        else
-          echo "No changes detected. Skipping push."
-        fi
+
+      - name: sync x86_64
+        run: |
+          set -euo pipefail
+
+          OPENWRT_VERSION="25.12"
+          TARGET_ENV="x86_64-6.12"
+          BASE_PATH="$OPENWRT_VERSION/targets/x86/64"
+
+          mkdir -p "$BASE_PATH"
+
+          API_URL="https://api.github.com/repos/MinimaxFlora/My-OpenWrt-Firmware/releases/tags/kmod-openwrt-${OPENWRT_VERSION}"
+
+          echo "========================================"
+          echo "Fetching kmod release information..."
+          echo "Release: kmod-openwrt-${OPENWRT_VERSION}"
+          echo "Target:  ${TARGET_ENV}"
+          echo "========================================"
+
+          # 获取最新的 x86_64-6.12 kmod
+          # 使用 jq 解析 GitHub API JSON，避免 grep + pipefail 导致误退出
+          kmod="$(
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$API_URL" |
+            jq -r --arg target "$TARGET_ENV" '
+              .assets[]
+              | select(.name | contains($target))
+              | select((.name | contains("-rc")) | not)
+              | .browser_download_url
+            ' |
+            sort -V |
+            tail -n 1
+          )"
+
+          if [ -z "$kmod" ]; then
+            echo "WARNING: No kmod package found for $TARGET_ENV"
+            echo "Release API: $API_URL"
+            exit 0
+          fi
+
+          echo "Found kmod package:"
+          echo "$kmod"
+
+          # 获取完整文件名
+          kmod_name="$(basename "$kmod" .tar.gz)"
+
+          echo "Kmod archive: $kmod_name.tar.gz"
+
+          # 下载
+          curl -fL \
+            "$kmod" \
+            -o "$kmod_name.tar.gz" \
+            --progress-bar
+
+          # 清理并创建临时目录
+          rm -rf tmp_x86
+          mkdir -p tmp_x86
+
+          echo "Extracting kmod package..."
+
+          tar -zxf "$kmod_name.tar.gz" -C tmp_x86
+
+          # 查找压缩包中的顶层目录
+          INNER_NAME="$(
+            find tmp_x86 \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -printf '%f\n' |
+            head -n 1
+          )"
+
+          if [ -z "$INNER_NAME" ]; then
+            echo "WARNING: No top-level directory found in kmod archive."
+
+            echo "Archive contents:"
+            find tmp_x86 -maxdepth 2 -print || true
+
+            rm -rf tmp_x86
+            rm -f "$kmod_name.tar.gz"
+
+            exit 0
+          fi
+
+          DIR_PATH="$BASE_PATH/$INNER_NAME"
+
+          echo "Kmod directory: $INNER_NAME"
+          echo "Target path:    $DIR_PATH"
+
+          if [ -d "$DIR_PATH" ]; then
+
+            echo "x86_64 target version $INNER_NAME already exists. Skipping."
+
+            rm -rf tmp_x86
+            rm -f "$kmod_name.tar.gz"
+
+          else
+
+            echo "Installing x86_64 kmod target..."
+
+            mv "tmp_x86/$INNER_NAME" "$DIR_PATH"
+
+            rm -rf tmp_x86
+            rm -f "$kmod_name.tar.gz"
+
+            # 检查是否产生 Git 变更
+            if [ -n "$(git status --porcelain -- "$DIR_PATH")" ]; then
+              echo "x86_64($INNER_NAME)" >> commit_msg.txt
+              echo "Added x86_64($INNER_NAME) to commit message."
+            fi
+
+          fi
+
+      - name: Git push to kmod branch
+        run: |
+          set -euo pipefail
+
+          git config --global user.email "zj18139624826@gmail.com"
+          git config --global user.name "MinimaxFlora"
+
+          echo "Generating index..."
+
+          python generate_index.py
+
+          git add 25.12/
+
+          if [ -n "$(git status --porcelain)" ]; then
+
+            if [ -f commit_msg.txt ]; then
+              CHANGED_ARCHS="$(paste -sd, commit_msg.txt)"
+              COMMIT_MSG="sync core: $CHANGED_ARCHS"
+            else
+              COMMIT_MSG="sync core: update index"
+            fi
+
+            rm -f commit_msg.txt
+
+            git add .
+
+            echo "Commit message:"
+            echo "$COMMIT_MSG"
+
+            git commit -sm "$COMMIT_MSG"
+
+            git push \
+              "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \
+              HEAD:kmod
+
+          else
+
+            echo "No changes detected. Skipping push."
+
+          fi
